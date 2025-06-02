@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/inference-sh/recws"
+	"github.com/recws-org/recws"
 )
 
 // Message represents a typed websocket message

@@ -4,8 +4,8 @@
 
 Reconnecting WebSocket is a websocket client based on [gorilla/websocket](https://github.com/gorilla/websocket) that will automatically reconnect if the connection is dropped - thread safe!
 
-[![GoDoc](https://godoc.org/github.com/inference-sh/recws?status.svg)](https://godoc.org/github.com/inference-sh/recws)
-[![Go Report Card](https://goreportcard.com/badge/github.com/inference-sh/recws)](https://goreportcard.com/report/github.com/inference-sh/recws)
+[![GoDoc](https://godoc.org/github.com/recws-org/recws?status.svg)](https://godoc.org/github.com/recws-org/recws)
+[![Go Report Card](https://goreportcard.com/badge/github.com/recws-org/recws)](https://goreportcard.com/report/github.com/recws-org/recws)
 [![GitHub license](https://img.shields.io/github/license/Naereen/StrapDown.js.svg)](https://github.com/Naereen/StrapDown.js/blob/master/LICENSE)
 
 ## Features
@@ -23,13 +23,13 @@ Reconnecting WebSocket is a websocket client based on [gorilla/websocket](https:
 ## Installation
 
 ```bash
-go get github.com/inference-sh/recws
+go get github.com/recws-org/recws
 ```
 
 ## Quick Start
 
 ```go
-import "github.com/inference-sh/recws"
+import "github.com/recws-org/recws"
 
 // Create a new reconnecting websocket
 ws := &recws.RecConn{
@@ -44,9 +44,14 @@ ws.Dial("ws://example.com/ws", nil)
 ws.WriteMessage(websocket.TextMessage, []byte("hello"))
 ```
 
-## Credits
+## Examples
 
-This project is a fork of [recws-org/recws](https://github.com/recws-org/recws) with significant improvements.
+See the [examples directory](examples/) for complete working examples.
+
+
+## Important Note
+This library is designed to be used as a WebSocket client (the connecting end) that initiates connections to a WebSocket server. It is not meant to be used for implementing WebSocket server endpoints. If you're looking to implement a WebSocket server, please use the `gorilla/websocket` package directly instead.
+
 
 ### Logo Credits
 - Logo by [Anastasia Marx](https://www.behance.net/AnastasiaMarx)
@@ -55,4 +60,3 @@ This project is a fork of [recws-org/recws](https://github.com/recws-org/recws) 
 ## License
 
 recws is open-source software licensed under the [MIT license](https://opensource.org/licenses/MIT).
-

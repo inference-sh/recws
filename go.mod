@@ -1,4 +1,4 @@
-module github.com/inference-sh/recws
+module github.com/recws-org/recws
 
 go 1.23
 

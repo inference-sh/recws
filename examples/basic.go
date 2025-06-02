@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/inference-sh/recws"
+	"github.com/recws-org/recws"
 )
 
 func ExampleBasic() {

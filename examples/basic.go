@@ -1,14 +1,14 @@
-package main
+package examples
 
 import (
 	"context"
 	"log"
 	"time"
 
-	"github.com/recws-org/recws"
+	"github.com/inference-sh/recws"
 )
 
-func main() {
+func ExampleBasic() {
 	ctx, cancel := context.WithCancel(context.Background())
 	ws := recws.RecConn{
 		KeepAliveTimeout: 10 * time.Second,

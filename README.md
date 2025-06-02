@@ -34,7 +34,6 @@ import "github.com/recws-org/recws"
 // Create a new reconnecting websocket
 ws := &recws.RecConn{
     KeepAliveTimeout: 30 * time.Second,
-    LogLevel: recws.LogLevelInfo,  // Debug, Info, Warn, Error levels available
 }
 
 // Connect (blocks until connection is established or timeout reached)

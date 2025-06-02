@@ -5,8 +5,6 @@ package recws
 import (
 	"crypto/tls"
 	"errors"
-	"fmt"
-	"log"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -17,64 +15,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/backoff"
 )
-
-// LogLevel type for controlling verbosity
-type LogLevel = slog.Level
-
-const (
-	// Standard log levels from slog package
-	LogLevelDebug = slog.LevelDebug
-	LogLevelInfo  = slog.LevelInfo
-	LogLevelWarn  = slog.LevelWarn
-	LogLevelError = slog.LevelError
-)
-
-// recwsLogger wraps the standard logger to add [recws] after timestamp
-type recwsLogger struct {
-	*log.Logger
-	level LogLevel
-}
-
-func (l *recwsLogger) SetLevel(level LogLevel) {
-	l.level = level
-}
-
-func (l *recwsLogger) shouldLog(level LogLevel) bool {
-	return level >= l.level
-}
-
-func (l *recwsLogger) Printf(level LogLevel, format string, v ...interface{}) {
-	if l.shouldLog(level) {
-		l.Output(2, fmt.Sprintf("[recws] "+format, v...))
-	}
-}
-
-func (l *recwsLogger) Println(level LogLevel, v ...interface{}) {
-	if l.shouldLog(level) {
-		l.Output(2, fmt.Sprint(append([]interface{}{"[recws] "}, v...)...))
-	}
-}
-
-func (l *recwsLogger) Fatalf(format string, v ...interface{}) {
-	l.Output(2, fmt.Sprintf("[recws] "+format, v...))
-	panic("exit due to fatal error")
-}
-
-// logger is the package-level logger instance
-var logger = &recwsLogger{
-	Logger: log.New(log.Writer(), "", log.LstdFlags|log.Lmicroseconds),
-	level:  LogLevelInfo, // Default to info level
-}
-
-// SetLogLevel sets the logging level for the package
-func SetLogLevel(level LogLevel) {
-	logger.SetLevel(level)
-}
-
-func init() {
-	// Initialize the logger with microseconds precision
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-}
 
 // ErrNotConnected is returned when the application read/writes
 // a message and the connection is closed
@@ -104,10 +44,10 @@ type RecConn struct {
 	// KeepAliveTimeout is an interval for sending ping/pong messages
 	// disabled if 0
 	KeepAliveTimeout time.Duration
-	// LogLevel controls the verbosity of logging, defaults to LogLevelInfo
-	LogLevel LogLevel
 	// Compression enables per-message compression as defined in https://datatracker.ietf.org/doc/html/rfc7692
 	Compression bool
+	// Logger is the logger instance to use. If nil, slog.Default() will be used.
+	Logger *slog.Logger
 
 	isConnected bool
 	mu          sync.RWMutex
@@ -123,7 +63,11 @@ type RecConn struct {
 
 // CloseAndReconnect will try to reconnect.
 func (rc *RecConn) CloseAndReconnect() {
-	logger.Println(LogLevelInfo, "closing connection and reconnecting")
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info("closing connection and reconnecting")
 	rc.Close()
 	go rc.connect()
 }
@@ -134,13 +78,6 @@ func (rc *RecConn) setIsConnected(state bool) {
 	defer rc.mu.Unlock()
 
 	rc.isConnected = state
-}
-
-func (rc *RecConn) getConn() *websocket.Conn {
-	rc.mu.RLock()
-	defer rc.mu.RUnlock()
-
-	return rc.Conn
 }
 
 // Close closes the underlying network connection without
@@ -162,10 +99,14 @@ func (rc *RecConn) Close() {
 // Shutdown gracefully closes the connection by sending the websocket.CloseMessage.
 // The writeWait param defines the duration before the deadline of the write operation is hit.
 func (rc *RecConn) Shutdown(writeWait time.Duration) {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 	err := rc.WriteControl(websocket.CloseMessage, msg, time.Now().Add(writeWait))
 	if err != nil && err != websocket.ErrCloseSent {
-		logger.Printf(LogLevelError, "shutdown error: %v", err)
+		logger.Error("shutdown error", "error", err)
 		rc.Close()
 	}
 }
@@ -175,6 +116,10 @@ func (rc *RecConn) Shutdown(writeWait time.Duration) {
 //
 // If the connection is closed ErrNotConnected is returned
 func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	err = ErrNotConnected
 	if rc.IsConnected() {
 		messageType, message, err = rc.Conn.ReadMessage()
@@ -183,8 +128,8 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 			return messageType, message, nil
 		}
 		if err != nil {
-			logger.Printf(LogLevelError, "read message error: %v", err)
-			logger.Println(LogLevelInfo, "closing connection and reconnecting")
+			logger.Error("read message error", "error", err)
+			logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -197,6 +142,10 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 //
 // If the connection is closed ErrNotConnected is returned
 func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		rc.mu.Lock()
@@ -207,8 +156,8 @@ func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
 			return nil
 		}
 		if err != nil {
-			logger.Printf(LogLevelError, "write message error: %v", err)
-			logger.Println(LogLevelInfo, "closing connection and reconnecting")
+			logger.Error("write message error", "error", err)
+			logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -218,6 +167,10 @@ func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
 
 // WriteJSON writes the JSON encoding of v to the connection.
 func (rc *RecConn) WriteJSON(v interface{}) error {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		rc.mu.Lock()
@@ -228,8 +181,8 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 			return nil
 		}
 		if err != nil {
-			logger.Printf(LogLevelError, "write json error: %v", err)
-			logger.Println(LogLevelInfo, "closing connection and reconnecting")
+			logger.Error("write json error", "error", err)
+			logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -238,6 +191,10 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 
 // ReadJSON reads the next JSON-encoded message from the connection.
 func (rc *RecConn) ReadJSON(v interface{}) error {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		err = rc.Conn.ReadJSON(v)
@@ -246,8 +203,8 @@ func (rc *RecConn) ReadJSON(v interface{}) error {
 			return nil
 		}
 		if err != nil {
-			logger.Printf(LogLevelError, "read json error: %v", err)
-			logger.Println(LogLevelInfo, "closing connection and reconnecting")
+			logger.Error("read json error", "error", err)
+			logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -335,15 +292,6 @@ func (rc *RecConn) setDefaultProxy() {
 	}
 }
 
-func (rc *RecConn) setDefaultLogLevel() {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	if rc.LogLevel == 0 {
-		rc.LogLevel = LogLevelInfo
-	}
-}
-
 func (rc *RecConn) setDefaultDialer(tlsClientConfig *tls.Config, handshakeTimeout time.Duration, compression bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -379,9 +327,13 @@ func (rc *RecConn) SetTLSClientConfig(tlsClientConfig *tls.Config) {
 
 // Dial creates a new client connection
 func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	urlStr, err := rc.parseURL(urlStr)
 	if err != nil {
-		logger.Fatalf("connection failed to dial: %v", err)
+		logger.Error("connection failed to dial", "error", err)
 	}
 
 	// Config setup
@@ -392,16 +344,12 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 	rc.setDefaultRecIntvlFactor()
 	rc.setDefaultHandshakeTimeout()
 	rc.setDefaultProxy()
-	rc.setDefaultLogLevel()
 	rc.setDefaultDialer(rc.getTLSClientConfig(), rc.getHandshakeTimeout(), rc.Compression)
-
-	// Set the package logger level to match this connection's level
-	SetLogLevel(rc.LogLevel)
 
 	connected := make(chan struct{})
 
 	// Connect
-	logger.Println(LogLevelInfo, "starting connection")
+	logger.Info("starting connection")
 	go func() {
 		rc.connect()
 		close(connected)
@@ -410,9 +358,9 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 	// Wait for either connection success or handshake timeout
 	select {
 	case <-connected:
-		logger.Println(LogLevelInfo, "connection established")
+		logger.Info("connection established")
 	case <-time.After(rc.getHandshakeTimeout()):
-		logger.Println(LogLevelError, "handshake timeout reached")
+		logger.Info("handshake timeout reached")
 	}
 }
 
@@ -458,6 +406,10 @@ func (rc *RecConn) writeControlPingMessage() error {
 }
 
 func (rc *RecConn) keepAlive() {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	var (
 		keepAliveResponse = new(keepAliveResponse)
 		ticker            = time.NewTicker(rc.getKeepAliveTimeout())
@@ -491,7 +443,7 @@ func (rc *RecConn) keepAlive() {
 				}
 
 				if err := rc.writeControlPingMessage(); err != nil {
-					logger.Printf(LogLevelError, "ping error: %v", err)
+					logger.Error("ping error", "error", err)
 				}
 
 				select {
@@ -499,9 +451,9 @@ func (rc *RecConn) keepAlive() {
 					return
 				case <-ticker.C:
 					if time.Since(keepAliveResponse.getLastResponse()) > rc.getKeepAliveTimeout() {
-						logger.Println(LogLevelError, "keepalive timeout reached, closing connection and reconnecting")
-						logger.Printf(LogLevelDebug, "keepalive timeout: %v", rc.getKeepAliveTimeout())
-						logger.Printf(LogLevelDebug, "time since last response: %v", time.Since(keepAliveResponse.getLastResponse()))
+						logger.Info("keepalive timeout reached, closing connection and reconnecting")
+						logger.Info("keepalive timeout", "timeout", rc.getKeepAliveTimeout())
+						logger.Info("time since last response", "duration", time.Since(keepAliveResponse.getLastResponse()))
 						rc.CloseAndReconnect()
 						return
 					}
@@ -512,6 +464,10 @@ func (rc *RecConn) keepAlive() {
 }
 
 func (rc *RecConn) connect() {
+	logger := rc.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	b := rc.getBackoff()
 	rand.Seed(time.Now().UTC().UnixNano())
 
@@ -527,13 +483,13 @@ func (rc *RecConn) connect() {
 		rc.mu.Unlock()
 
 		if err == nil {
-			logger.Printf(LogLevelInfo, "connection was successfully established with %s", rc.url)
+			logger.Info("connection was successfully established", "url", rc.url)
 
 			if rc.hasSubscribeHandler() {
 				if err := rc.SubscribeHandler(); err != nil {
-					logger.Fatalf("connect handler failed with %s", err.Error())
+					logger.Error("connect handler failed", "error", err)
 				}
-				logger.Printf(LogLevelInfo, "connect handler was successfully established with %s", rc.url)
+				logger.Info("connect handler was successfully established", "url", rc.url)
 			}
 
 			if rc.getKeepAliveTimeout() != 0 {
@@ -542,8 +498,8 @@ func (rc *RecConn) connect() {
 			return
 		}
 
-		logger.Printf(LogLevelError, "connection error: %v", err)
-		logger.Printf(LogLevelInfo, "connection will try again in %v seconds", nextItvl)
+		logger.Error("connection error", "error", err)
+		logger.Info("connection will try again", "delay", nextItvl)
 		time.Sleep(nextItvl)
 	}
 }

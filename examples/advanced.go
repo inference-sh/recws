@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,8 @@ func ExampleAdvanced() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
 	// Setup WebSocket connection with options
 	ws := recws.RecConn{
 		HandshakeTimeout: 10 * time.Second,
@@ -36,7 +39,7 @@ func ExampleAdvanced() {
 		RecIntvlMax:      30 * time.Second,
 		RecIntvlFactor:   1.5,
 		KeepAliveTimeout: 60 * time.Second,
-		LogLevel:         recws.LogLevelInfo,
+		Logger:           logger,
 	}
 
 	// Setup headers if needed

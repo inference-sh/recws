@@ -44,6 +44,15 @@ ws.Dial("ws://example.com/ws", nil)
 ws.WriteMessage(websocket.TextMessage, []byte("hello"))
 ```
 
+## Examples
+
+See the [examples directory](examples/) for complete working examples.
+
+
+## Important Note
+
+This library is designed to be used as a WebSocket client (the connecting end) that initiates connections to a WebSocket server. It is not meant to be used for implementing WebSocket server endpoints. If you're looking to implement a WebSocket server, please use the `gorilla/websocket` package directly instead.
+
 ## Credits
 
 This project is a fork of [recws-org/recws](https://github.com/recws-org/recws) with significant improvements.

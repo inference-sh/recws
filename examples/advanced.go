@@ -3,7 +3,6 @@ package examples
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,8 +29,9 @@ func ExampleAdvanced() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Create a custom slog logger
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: slog.LevelDebug,
 	}))
 
 	// Setup WebSocket connection with options
@@ -41,7 +41,7 @@ func ExampleAdvanced() {
 		RecIntvlMax:      30 * time.Second,
 		RecIntvlFactor:   1.5,
 		KeepAliveTimeout: 60 * time.Second,
-		Logger:           logger,
+		Logger:           logger, // slog.Logger implements our Logger interface
 	}
 
 	// Setup headers if needed
@@ -63,14 +63,14 @@ func ExampleAdvanced() {
 				return
 			default:
 				if !ws.IsConnected() {
-					log.Printf("WebSocket disconnected, waiting for reconnection...")
+					logger.Warn("WebSocket disconnected, waiting for reconnection...")
 					time.Sleep(time.Second)
 					continue
 				}
 
 				var msg Message
 				if err := ws.ReadJSON(&msg); err != nil {
-					log.Printf("Error reading message: %v", err)
+					logger.Error("Error reading message", "error", err)
 					continue
 				}
 
@@ -79,12 +79,12 @@ func ExampleAdvanced() {
 				case "chat":
 					var chatMsg ChatMessage
 					if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
-						log.Printf("Error unmarshaling chat message: %v", err)
+						logger.Error("Error unmarshaling chat message", "error", err)
 						continue
 					}
-					log.Printf("Received chat message: %s", chatMsg.Text)
+					logger.Info("Received chat message", "text", chatMsg.Text)
 				default:
-					log.Printf("Received unknown message type: %s", msg.Type)
+					logger.Debug("Received unknown message type", "type", msg.Type)
 				}
 			}
 		}
@@ -108,9 +108,9 @@ func ExampleAdvanced() {
 				}
 
 				if err := ws.WriteJSON(chatMsg); err != nil {
-					log.Printf("Error sending message: %v", err)
+					logger.Error("Error sending message", "error", err)
 				} else {
-					log.Printf("Sent chat message successfully")
+					logger.Debug("Sent chat message successfully")
 				}
 			}
 		}
@@ -118,11 +118,11 @@ func ExampleAdvanced() {
 
 	// Wait for shutdown signal
 	<-sigChan
-	log.Println("Shutting down...")
+	logger.Info("Shutting down...")
 
 	// Cleanup
 	ticker.Stop()
 	cancel()
 	ws.Close()
-	log.Println("Shutdown complete")
+	logger.Info("Shutdown complete")
 }

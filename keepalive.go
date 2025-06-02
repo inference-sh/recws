@@ -23,3 +23,11 @@ func (k *keepAliveResponse) getLastResponse() time.Time {
 
 	return k.lastResponse
 }
+
+// reset resets the keep-alive response state
+func (k *keepAliveResponse) reset() {
+	k.Lock()
+	defer k.Unlock()
+
+	k.lastResponse = time.Time{} // Set to zero time
+}

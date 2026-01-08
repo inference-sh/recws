@@ -10,3 +10,6 @@ linter-ls-lint:
 linter:
 	make linter-ls-lint
 	make linter-golangci-lint
+
+test:
+	go test -v -race ./...

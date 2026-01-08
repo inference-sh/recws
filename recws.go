@@ -130,7 +130,6 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 		}
 		if err != nil {
 			rc.Logger.Error("read message error", "error", err)
-			rc.Logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -153,7 +152,6 @@ func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
 		}
 		if err != nil {
 			rc.Logger.Error("write message error", "error", err)
-			rc.Logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -173,7 +171,6 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 		}
 		if err != nil {
 			rc.Logger.Error("write json error", "error", err)
-			rc.Logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -191,7 +188,6 @@ func (rc *RecConn) ReadJSON(v interface{}) error {
 		}
 		if err != nil {
 			rc.Logger.Error("read json error", "error", err)
-			rc.Logger.Info("closing connection and reconnecting")
 			rc.CloseAndReconnect()
 		}
 	}
@@ -350,7 +346,6 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 	// Wait for either connection success or handshake timeout
 	select {
 	case <-connected:
-		rc.Logger.Info("connection established")
 	case <-time.After(rc.getHandshakeTimeout()):
 		rc.Logger.Info("handshake timeout reached")
 	}
@@ -471,9 +466,13 @@ func (rc *RecConn) connect() {
 
 			if rc.hasSubscribeHandler() {
 				if err := rc.SubscribeHandler(); err != nil {
-					rc.Logger.Error("connect handler failed", "error", err)
+					rc.Logger.Error("SubscribeHandler failed", "error", err)
+					rc.Close()
+					rc.Logger.Info("connection will try again", "delay", nextItvl)
+					time.Sleep(nextItvl)
+					continue
 				}
-				rc.Logger.Info("connect handler was successfully established", "url", rc.url)
+				rc.Logger.Info("SubscribeHandler was successfully established", "url", rc.url)
 			}
 
 			if rc.getKeepAliveTimeout() != 0 {

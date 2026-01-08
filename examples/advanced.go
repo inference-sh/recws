@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/recws-org/recws"
+	"github.com/inference-sh/recws"
 )
 
 // Message represents a typed websocket message

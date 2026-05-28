@@ -62,23 +62,31 @@ type RecConn struct {
 	// Logger is the logger instance to use. If nil, DefaultLogger() will be used.
 	Logger Logger
 
-	isConnected bool
-	mu          sync.RWMutex
-	url         string
-	reqHeader   http.Header
-	httpResp    *http.Response
-	dialErr     error
-	dialer      *websocket.Dialer
-	done        chan struct{} // Channel to signal goroutine shutdown
+	isConnected  bool
+	reconnecting sync.Once // guards concurrent CloseAndReconnect calls
+	mu           sync.RWMutex
+	url          string
+	reqHeader    http.Header
+	httpResp     *http.Response
+	dialErr      error
+	dialer       *websocket.Dialer
+	done         chan struct{} // Channel to signal goroutine shutdown
 
 	*websocket.Conn
 }
 
 // CloseAndReconnect will try to reconnect.
+// Safe to call concurrently — only the first caller triggers a reconnect,
+// subsequent calls are no-ops until the reconnect completes.
 func (rc *RecConn) CloseAndReconnect() {
-	rc.Logger.Info("closing connection and reconnecting")
-	rc.Close()
-	go rc.connect()
+	rc.reconnecting.Do(func() {
+		rc.Logger.Info("closing connection and reconnecting")
+		rc.Close()
+		go func() {
+			rc.connect()
+			rc.reconnecting = sync.Once{} // reset for next disconnect
+		}()
+	})
 }
 
 // setIsConnected sets state for isConnected

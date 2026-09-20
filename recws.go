@@ -489,7 +489,7 @@ func (rc *RecConn) connect() {
 			return
 		}
 
-		rc.Logger.Error("connection error", "error", err)
+		nextItvl = rc.handshakeBackoff(err, httpResp, nextItvl)
 		rc.Logger.Info("connection will try again", "delay", nextItvl)
 		time.Sleep(nextItvl)
 	}

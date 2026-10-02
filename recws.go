@@ -54,6 +54,12 @@ type RecConn struct {
 	TLSClientConfig *tls.Config
 	// SubscribeHandler fires after the connection successfully establish.
 	SubscribeHandler func() error
+	// HeaderFunc, when set, supplies the request header for every dial
+	// attempt, in place of the one given to Dial. A connection that outlives
+	// its credential needs it: the header given to Dial is fixed for the
+	// life of the connection, so a rotated token would be refused on every
+	// reconnect. Set it before Dial; it is called from the dial goroutine.
+	HeaderFunc func() http.Header
 	// KeepAliveTimeout is an interval for sending ping/pong messages
 	// disabled if 0
 	KeepAliveTimeout time.Duration
@@ -460,7 +466,7 @@ func (rc *RecConn) connect() {
 
 	for {
 		nextItvl := b.Duration()
-		wsConn, httpResp, err := rc.dialer.Dial(rc.url, rc.reqHeader)
+		wsConn, httpResp, err := rc.dialer.Dial(rc.url, rc.dialHeader())
 
 		rc.mu.Lock()
 		rc.Conn = wsConn
@@ -493,6 +499,18 @@ func (rc *RecConn) connect() {
 		rc.Logger.Info("connection will try again", "delay", nextItvl)
 		time.Sleep(nextItvl)
 	}
+}
+
+// dialHeader is the request header for the next dial attempt: HeaderFunc's
+// when one is set, otherwise the header given to Dial.
+func (rc *RecConn) dialHeader() http.Header {
+	if rc.HeaderFunc != nil {
+		return rc.HeaderFunc()
+	}
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	return rc.reqHeader
 }
 
 // GetHTTPResponse returns the http response from the handshake.

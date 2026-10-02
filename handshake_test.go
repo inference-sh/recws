@@ -5,9 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // refusingServer answers every upgrade with status and the given headers, and
@@ -102,5 +105,62 @@ func TestRetryAfter(t *testing.T) {
 		if got := retryAfter(resp, now); got != c.want {
 			t.Errorf("Retry-After %q: got %v want %v", c.header, got, c.want)
 		}
+	}
+}
+
+// A credential that changes between attempts is picked up on the next dial:
+// the server refuses the first token and accepts the rotated one, and the
+// header given to Dial is not what gets sent.
+func TestHandshake_HeaderFuncIsAskedOnEveryAttempt(t *testing.T) {
+	var seen []string
+	var mu sync.Mutex
+	upgrader := websocket.Upgrader{}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		seen = append(seen, auth)
+		mu.Unlock()
+		if auth != "Bearer fresh" {
+			http.Error(w, "refused", http.StatusServiceUnavailable)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _, _ = c.ReadMessage()
+	}))
+	t.Cleanup(s.Close)
+
+	var calls atomic.Int32
+	rc := &RecConn{
+		HandshakeTimeout: 200 * time.Millisecond,
+		RecIntvlMin:      20 * time.Millisecond,
+		RecIntvlMax:      40 * time.Millisecond,
+		RecIntvlFactor:   1.5,
+		Logger:           slog.Default(),
+		HeaderFunc: func() http.Header {
+			token := "stale"
+			if calls.Add(1) > 1 {
+				token = "fresh"
+			}
+			return http.Header{"Authorization": {"Bearer " + token}}
+		},
+	}
+	rc.Dial("ws"+strings.TrimPrefix(s.URL, "http"), http.Header{"Authorization": {"Bearer from-dial"}})
+	t.Cleanup(rc.Close)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !rc.IsConnected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rc.IsConnected() {
+		t.Fatal("expected the rotated credential to connect")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "Bearer stale" || seen[1] != "Bearer fresh" {
+		t.Fatalf("expected the stale then the fresh credential, got %q", seen)
 	}
 }

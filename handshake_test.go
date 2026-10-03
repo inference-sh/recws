@@ -31,8 +31,9 @@ func refusingServer(t *testing.T, status int, header map[string]string) (*httpte
 
 // dialRefusing dials s with a short handshake timeout so Dial returns
 // promptly (it otherwise blocks up to HandshakeTimeout while refused) and
-// the timings below count from the first attempt.
-func dialRefusing(t *testing.T, s *httptest.Server, min, max time.Duration) *RecConn {
+// the timings below count from the first attempt. tune, when given, adjusts
+// the connection before it dials.
+func dialRefusing(t *testing.T, s *httptest.Server, min, max time.Duration, tune ...func(*RecConn)) *RecConn {
 	t.Helper()
 	rc := &RecConn{
 		HandshakeTimeout: 200 * time.Millisecond,
@@ -41,7 +42,10 @@ func dialRefusing(t *testing.T, s *httptest.Server, min, max time.Duration) *Rec
 		RecIntvlFactor:   1.5,
 		Logger:           slog.Default(),
 	}
-	rc.Dial("ws"+strings.TrimPrefix(s.URL, "http"), nil)
+	for _, f := range tune {
+		f(rc)
+	}
+	rc.Dial("ws"+strings.TrimPrefix(s.URL, "http"), http.Header{"Authorization": {"Bearer from-dial"}})
 	t.Cleanup(rc.Close)
 	return rc
 }
@@ -134,22 +138,15 @@ func TestHandshake_HeaderFuncIsAskedOnEveryAttempt(t *testing.T) {
 	t.Cleanup(s.Close)
 
 	var calls atomic.Int32
-	rc := &RecConn{
-		HandshakeTimeout: 200 * time.Millisecond,
-		RecIntvlMin:      20 * time.Millisecond,
-		RecIntvlMax:      40 * time.Millisecond,
-		RecIntvlFactor:   1.5,
-		Logger:           slog.Default(),
-		HeaderFunc: func() http.Header {
+	rc := dialRefusing(t, s, 20*time.Millisecond, 40*time.Millisecond, func(rc *RecConn) {
+		rc.HeaderFunc = func() http.Header {
 			token := "stale"
 			if calls.Add(1) > 1 {
 				token = "fresh"
 			}
 			return http.Header{"Authorization": {"Bearer " + token}}
-		},
-	}
-	rc.Dial("ws"+strings.TrimPrefix(s.URL, "http"), http.Header{"Authorization": {"Bearer from-dial"}})
-	t.Cleanup(rc.Close)
+		}
+	})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for !rc.IsConnected() && time.Now().Before(deadline) {
@@ -162,5 +159,36 @@ func TestHandshake_HeaderFuncIsAskedOnEveryAttempt(t *testing.T) {
 	defer mu.Unlock()
 	if len(seen) != 2 || seen[0] != "Bearer stale" || seen[1] != "Bearer fresh" {
 		t.Fatalf("expected the stale then the fresh credential, got %q", seen)
+	}
+}
+
+// A connection that was established and then dropped has no handshake answer
+// until its next attempt is answered: the 101 that established it is not
+// what the server said last.
+func TestClose_forgetsTheLastDialsAnswer(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _, _ = c.ReadMessage()
+	}))
+	t.Cleanup(s.Close)
+
+	rc := dialRefusing(t, s, time.Hour, time.Hour)
+	deadline := time.Now().Add(2 * time.Second)
+	for !rc.IsConnected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if resp := rc.GetHTTPResponse(); resp == nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected the 101 while connected, got %v", resp)
+	}
+
+	rc.Close()
+
+	if rc.GetHTTPResponse() != nil || rc.GetDialError() != nil {
+		t.Fatalf("a closed connection keeps no handshake answer, got %v / %v", rc.GetHTTPResponse(), rc.GetDialError())
 	}
 }

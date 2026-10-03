@@ -105,6 +105,12 @@ func (rc *RecConn) setIsConnected(state bool) {
 
 // Close closes the underlying network connection without
 // sending or waiting for a close frame.
+//
+// It also forgets the last dial's answer. A closed connection has no
+// handshake response and no dial error until its next attempt; keeping the
+// old ones made a connection that was established and then dropped report
+// the 101 that established it, which readers of GetHTTPResponse had to know
+// to ignore.
 func (rc *RecConn) Close() {
 	rc.mu.Lock()
 	if rc.done != nil {
@@ -114,6 +120,8 @@ func (rc *RecConn) Close() {
 	if rc.Conn != nil {
 		rc.Conn.Close()
 	}
+	rc.httpResp = nil
+	rc.dialErr = nil
 	rc.mu.Unlock()
 
 	rc.setIsConnected(false)

@@ -33,7 +33,8 @@ import "github.com/inference-sh/recws"
 
 // Create a new reconnecting websocket
 ws := &recws.RecConn{
-    KeepAliveTimeout: 30 * time.Second,
+    KeepAliveTimeout: 30 * time.Second, // redial after 30s with no pong or message
+    // KeepAlivePingInterval defaults to KeepAliveTimeout/3
 }
 
 // Connect (blocks until connection is established or timeout reached)

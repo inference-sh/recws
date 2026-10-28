@@ -140,7 +140,8 @@ func TestKeepAlive_FastPeerNoFalseTimeout(t *testing.T) {
 }
 
 // A peer that stops answering pings must be redialed within about
-// timeout + interval, and not before a full timeout from the connect.
+// timeout + interval, and not before a full timeout from the connect: the
+// first read deadline is set at connect.
 func TestKeepAlive_DeadPeerReconnects(t *testing.T) {
 	srv := newKAServer(t, false, 0)
 
@@ -175,9 +176,8 @@ func TestKeepAlive_DeadPeerReconnects(t *testing.T) {
 	if len(accepts) < 2 {
 		t.Fatalf("dead peer: no reconnect within 5s")
 	}
-	// The server stamps the accept a little before the client starts its
-	// clock, so allow a few milliseconds under the timeout. Measuring from a
-	// zero last-response time would redial at the first ping interval.
+	// The server stamps the accept a little before the client sets its
+	// first read deadline, so allow a few milliseconds under the timeout.
 	gap := accepts[1].Sub(accepts[0])
 	if gap < timeout-interval/2 {
 		t.Fatalf("dead peer: redialed after %v, before the %v timeout", gap, timeout)

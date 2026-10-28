@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -60,16 +61,22 @@ type RecConn struct {
 	// life of the connection, so a rotated token would be refused on every
 	// reconnect. Set it before Dial; it is called from the dial goroutine.
 	HeaderFunc func() http.Header
-	// KeepAliveTimeout is an interval for sending ping/pong messages
-	// disabled if 0
+	// KeepAliveTimeout is how long the connection may go without a pong, or
+	// any message read through RecConn, before it is closed and redialed.
+	// Disabled if 0.
 	KeepAliveTimeout time.Duration
+	// KeepAlivePingInterval is how often a ping is sent while KeepAliveTimeout
+	// is set. Defaults to KeepAliveTimeout/3; values above KeepAliveTimeout
+	// are clamped to it. A dead peer is noticed within about
+	// KeepAliveTimeout + KeepAlivePingInterval.
+	KeepAlivePingInterval time.Duration
 	// Compression enables per-message compression as defined in https://datatracker.ietf.org/doc/html/rfc7692
 	Compression bool
 	// Logger is the logger instance to use. If nil, DefaultLogger() will be used.
 	Logger Logger
 
 	isConnected  bool
-	reconnecting sync.Once // guards concurrent CloseAndReconnect calls
+	reconnecting atomic.Bool // set while a CloseAndReconnect is in flight
 	mu           sync.RWMutex
 	url          string
 	reqHeader    http.Header
@@ -78,6 +85,9 @@ type RecConn struct {
 	dialer       *websocket.Dialer
 	done         chan struct{} // Channel to signal goroutine shutdown
 
+	keepAliveResp keepAliveResponse
+	pongHandler   func(appData string) error // caller's, kept across reconnects
+
 	*websocket.Conn
 }
 
@@ -85,14 +95,17 @@ type RecConn struct {
 // Safe to call concurrently — only the first caller triggers a reconnect,
 // subsequent calls are no-ops until the reconnect completes.
 func (rc *RecConn) CloseAndReconnect() {
-	rc.reconnecting.Do(func() {
-		rc.Logger.Info("closing connection and reconnecting")
-		rc.Close()
-		go func() {
-			rc.connect()
-			rc.reconnecting = sync.Once{} // reset for next disconnect
-		}()
-	})
+	// A sync.Once replaced with a fresh one after the reconnect raced with
+	// concurrent Do calls; a flag does the same job without the race.
+	if !rc.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	rc.Logger.Info("closing connection and reconnecting")
+	rc.Close()
+	go func() {
+		rc.connect()
+		rc.reconnecting.Store(false) // reset for next disconnect
+	}()
 }
 
 // setIsConnected sets state for isConnected
@@ -146,6 +159,9 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 	err = ErrNotConnected
 	if rc.IsConnected() {
 		messageType, message, err = rc.Conn.ReadMessage()
+		if err == nil {
+			rc.keepAliveResp.setLastResponse()
+		}
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 			rc.Close()
 			return messageType, message, nil
@@ -204,6 +220,9 @@ func (rc *RecConn) ReadJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		err = rc.Conn.ReadJSON(v)
+		if err == nil {
+			rc.keepAliveResp.setLastResponse()
+		}
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 			rc.Close()
 			return nil
@@ -407,21 +426,74 @@ func (rc *RecConn) getKeepAliveTimeout() time.Duration {
 	return rc.KeepAliveTimeout
 }
 
-func (rc *RecConn) writeControlPingMessage() error {
+// getKeepAlivePingInterval returns KeepAlivePingInterval, defaulted to a
+// third of the timeout and clamped to the timeout.
+func (rc *RecConn) getKeepAlivePingInterval() time.Duration {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	timeout, interval := rc.KeepAliveTimeout, rc.KeepAlivePingInterval
+	if interval <= 0 {
+		interval = timeout / defaultPingDivisor
+	}
+	if interval > timeout {
+		interval = timeout
+	}
+	if interval <= 0 {
+		interval = timeout
+	}
+	return interval
+}
+
+// SetPongHandler sets the handler for pong messages received from the peer.
+// It shadows the embedded websocket.Conn method: keepalive needs to see every
+// pong, so the caller's handler is wrapped rather than allowed to replace
+// keepalive's, and it is kept across reconnects. Calling SetPongHandler on
+// the embedded Conn directly still replaces keepalive's handler for that
+// connection.
+func (rc *RecConn) SetPongHandler(h func(appData string) error) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	return rc.Conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
+	rc.pongHandler = h
+	if rc.Conn != nil && rc.KeepAliveTimeout != 0 {
+		rc.Conn.SetPongHandler(rc.wrapPongHandlerLocked())
+	} else if rc.Conn != nil {
+		rc.Conn.SetPongHandler(h)
+	}
 }
 
-func (rc *RecConn) keepAlive() {
-	var (
-		keepAliveResponse = new(keepAliveResponse)
-		ticker            = time.NewTicker(rc.getKeepAliveTimeout())
-	)
+// wrapPongHandlerLocked returns a pong handler that records the pong for
+// keepalive and then runs the caller's handler, if any. rc.mu must be held.
+func (rc *RecConn) wrapPongHandlerLocked() func(string) error {
+	user := rc.pongHandler
+	return func(appData string) error {
+		rc.keepAliveResp.setLastResponse()
+		if user != nil {
+			return user(appData)
+		}
+		return nil
+	}
+}
 
-	// Reset the keep-alive state
-	keepAliveResponse.reset()
+// keepAlive pings the peer every ping interval and redials when nothing has
+// come back for the full timeout.
+//
+// It used to ping once per timeout and then check the last pong against
+// that same timeout. The pong it checked was the one for the previous ping,
+// which landed one round trip after the previous tick, so the check compared
+// "timeout + ticker jitter - RTT" against "timeout": on a fast link it
+// tripped at random on a healthy connection.
+//
+// Pongs are only handled while the application is reading. A reader that
+// stops reading, or blocks for longer than the timeout between reads, starves
+// pong handling and the connection is redialed even if the peer is fine.
+func (rc *RecConn) keepAlive() {
+	timeout := rc.getKeepAliveTimeout()
+	interval := rc.getKeepAlivePingInterval()
+
+	// The connect time counts as the last response.
+	rc.keepAliveResp.reset()
 
 	rc.mu.Lock()
 	if rc.done != nil {
@@ -429,40 +501,32 @@ func (rc *RecConn) keepAlive() {
 	}
 	rc.done = make(chan struct{})
 	done := rc.done // Store in local var to prevent race conditions
-	rc.Conn.SetPongHandler(func(msg string) error {
-		keepAliveResponse.setLastResponse()
-		return nil
-	})
+	conn := rc.Conn // ping this connection only, never its successor
+	conn.SetPongHandler(rc.wrapPongHandlerLocked())
 	rc.mu.Unlock()
 
 	go func() {
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {
+			// WriteControl may be called concurrently with other writes,
+			// so the ping does not wait behind a slow WriteMessage.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(interval)); err != nil {
+				rc.Logger.Error("ping error", "error", err)
+			}
+
 			select {
 			case <-done:
 				return
-			default:
-				if !rc.IsConnected() {
-					continue
-				}
+			case <-ticker.C:
+			}
 
-				if err := rc.writeControlPingMessage(); err != nil {
-					rc.Logger.Error("ping error", "error", err)
-				}
-
-				select {
-				case <-done:
-					return
-				case <-ticker.C:
-					if time.Since(keepAliveResponse.getLastResponse()) > rc.getKeepAliveTimeout() {
-						rc.Logger.Info("keepalive timeout reached, closing connection and reconnecting")
-						rc.Logger.Info("keepalive timeout", "timeout", rc.getKeepAliveTimeout())
-						rc.Logger.Info("time since last response", "duration", time.Since(keepAliveResponse.getLastResponse()))
-						rc.CloseAndReconnect()
-						return
-					}
-				}
+			if since := time.Since(rc.keepAliveResp.getLastResponse()); since > timeout {
+				rc.Logger.Info("keepalive timeout reached, closing connection and reconnecting",
+					"timeout", timeout, "interval", interval, "since_last_response", since)
+				rc.CloseAndReconnect()
+				return
 			}
 		}
 	}()

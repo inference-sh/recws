@@ -63,7 +63,9 @@ type RecConn struct {
 	HeaderFunc func() http.Header
 	// KeepAliveTimeout is how long the connection may go without a pong, or
 	// any message read through RecConn, before it is closed and redialed.
-	// Disabled if 0.
+	// It is the read deadline: set at connect and pushed forward on every
+	// pong and every message read, so a read that waits longer fails and the
+	// reader's error redials. Disabled if 0.
 	KeepAliveTimeout time.Duration
 	// KeepAlivePingInterval is how often a ping is sent while KeepAliveTimeout
 	// is set. Defaults to KeepAliveTimeout/3; values above KeepAliveTimeout
@@ -85,8 +87,7 @@ type RecConn struct {
 	dialer       *websocket.Dialer
 	done         chan struct{} // Channel to signal goroutine shutdown
 
-	keepAliveResp keepAliveResponse
-	pongHandler   func(appData string) error // caller's, kept across reconnects
+	pongHandler func(appData string) error // caller's, kept across reconnects
 
 	*websocket.Conn
 }
@@ -158,9 +159,10 @@ func (rc *RecConn) Shutdown(writeWait time.Duration) {
 func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 	err = ErrNotConnected
 	if rc.IsConnected() {
-		messageType, message, err = rc.Conn.ReadMessage()
+		conn := rc.conn()
+		messageType, message, err = conn.ReadMessage()
 		if err == nil {
-			rc.keepAliveResp.setLastResponse()
+			rc.extendReadDeadline(conn)
 		}
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 			rc.Close()
@@ -219,9 +221,10 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 func (rc *RecConn) ReadJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
-		err = rc.Conn.ReadJSON(v)
+		conn := rc.conn()
+		err = conn.ReadJSON(v)
 		if err == nil {
-			rc.keepAliveResp.setLastResponse()
+			rc.extendReadDeadline(conn)
 		}
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 			rc.Close()
@@ -436,10 +439,7 @@ func (rc *RecConn) getKeepAlivePingInterval() time.Duration {
 	if interval <= 0 {
 		interval = timeout / defaultPingDivisor
 	}
-	if interval > timeout {
-		interval = timeout
-	}
-	if interval <= 0 {
+	if interval <= 0 || interval > timeout {
 		interval = timeout
 	}
 	return interval
@@ -456,19 +456,20 @@ func (rc *RecConn) SetPongHandler(h func(appData string) error) {
 	defer rc.mu.Unlock()
 
 	rc.pongHandler = h
-	if rc.Conn != nil && rc.KeepAliveTimeout != 0 {
-		rc.Conn.SetPongHandler(rc.wrapPongHandlerLocked())
-	} else if rc.Conn != nil {
-		rc.Conn.SetPongHandler(h)
+	if rc.Conn != nil {
+		rc.Conn.SetPongHandler(rc.wrapPongHandlerLocked(rc.Conn))
 	}
 }
 
-// wrapPongHandlerLocked returns a pong handler that records the pong for
-// keepalive and then runs the caller's handler, if any. rc.mu must be held.
-func (rc *RecConn) wrapPongHandlerLocked() func(string) error {
-	user := rc.pongHandler
+// wrapPongHandlerLocked returns a pong handler for conn that pushes its read
+// deadline forward and then runs the caller's handler, if any. rc.mu must be
+// held.
+func (rc *RecConn) wrapPongHandlerLocked(conn *websocket.Conn) func(string) error {
+	user, timeout := rc.pongHandler, rc.KeepAliveTimeout
 	return func(appData string) error {
-		rc.keepAliveResp.setLastResponse()
+		if timeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(timeout))
+		}
 		if user != nil {
 			return user(appData)
 		}
@@ -476,8 +477,27 @@ func (rc *RecConn) wrapPongHandlerLocked() func(string) error {
 	}
 }
 
-// keepAlive pings the peer every ping interval and redials when nothing has
-// come back for the full timeout.
+// conn returns the current connection.
+func (rc *RecConn) conn() *websocket.Conn {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	return rc.Conn
+}
+
+// extendReadDeadline pushes conn's read deadline a full keepalive timeout
+// past now, after a message was read from it.
+func (rc *RecConn) extendReadDeadline(conn *websocket.Conn) {
+	if timeout := rc.getKeepAliveTimeout(); timeout > 0 {
+		conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+}
+
+// keepAlive sets the read deadline for a new connection and pings the peer
+// every ping interval. Each pong, and each message read, pushes the deadline
+// a full timeout forward. When nothing comes back in time the blocked read
+// fails, and the reader's error closes and redials the connection, so a dead
+// peer is caught within about timeout + interval.
 //
 // It used to ping once per timeout and then check the last pong against
 // that same timeout. The pong it checked was the one for the previous ping,
@@ -486,14 +506,11 @@ func (rc *RecConn) wrapPongHandlerLocked() func(string) error {
 // tripped at random on a healthy connection.
 //
 // Pongs are only handled while the application is reading. A reader that
-// stops reading, or blocks for longer than the timeout between reads, starves
-// pong handling and the connection is redialed even if the peer is fine.
+// blocks for longer than the timeout between reads lets the deadline pass,
+// and its next read fails even if the peer is fine.
 func (rc *RecConn) keepAlive() {
 	timeout := rc.getKeepAliveTimeout()
 	interval := rc.getKeepAlivePingInterval()
-
-	// The connect time counts as the last response.
-	rc.keepAliveResp.reset()
 
 	rc.mu.Lock()
 	if rc.done != nil {
@@ -502,7 +519,7 @@ func (rc *RecConn) keepAlive() {
 	rc.done = make(chan struct{})
 	done := rc.done // Store in local var to prevent race conditions
 	conn := rc.Conn // ping this connection only, never its successor
-	conn.SetPongHandler(rc.wrapPongHandlerLocked())
+	conn.SetReadDeadline(time.Now().Add(timeout))
 	rc.mu.Unlock()
 
 	go func() {
@@ -521,13 +538,6 @@ func (rc *RecConn) keepAlive() {
 				return
 			case <-ticker.C:
 			}
-
-			if since := time.Since(rc.keepAliveResp.getLastResponse()); since > timeout {
-				rc.Logger.Info("keepalive timeout reached, closing connection and reconnecting",
-					"timeout", timeout, "interval", interval, "since_last_response", since)
-				rc.CloseAndReconnect()
-				return
-			}
 		}
 	}()
 }
@@ -542,6 +552,9 @@ func (rc *RecConn) connect() {
 
 		rc.mu.Lock()
 		rc.Conn = wsConn
+		if wsConn != nil {
+			wsConn.SetPongHandler(rc.wrapPongHandlerLocked(wsConn))
+		}
 		rc.dialErr = err
 		rc.isConnected = err == nil
 		rc.httpResp = httpResp
